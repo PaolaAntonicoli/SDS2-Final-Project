@@ -1,0 +1,1582 @@
+---
+title: "Antonicoli Paola Final Project"
+author: "Antonicoli Paola"
+date: "15/08/2022"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  markdown: 
+    wrap: 100
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set( warning = FALSE, message = FALSE) 
+```
+
+
+```{r, include=FALSE,message=FALSE, warning=FALSE}
+library(ggplot2)
+library(ggdag)
+library(scales)
+library(R2jags)
+library(ggmcmc)
+library(plyr)
+library(tidyverse)
+library(grid)
+library(reshape2)
+library(bayesforecast)
+library(e1071)
+library(ExtDist)
+library(latex2exp)
+library(randomForest)
+library(cvms)
+library(tibble)
+library(grid)
+library(gridExtra)
+library(ggpubr)
+library(smotefamily)
+library(ggcorrplot)
+library(plotly)
+library(gt)
+library(MLmetrics)
+library(pROC)
+library(TeachingDemos)
+```
+
+```{r, include=FALSE}
+# Imports
+data <- read.csv("diabetes.csv", header = TRUE)
+```
+
+# Diabetes on PIMA Dataset
+
+In this project we will apply a Fully Bayesian Logistic Regression model aimed at predicting the
+onset of diabetes mellitus in Pima Indians given diagnostic measurements.\
+Diabetes is a metabolic disorders characterized by a high blood sugar level (hyperglycemia) over a
+prolonged period of time. It is mainly due to the reduction of insulin production or lack of
+capability by the cells to properly respond to the insulin produced.
+
+The dataset used is **Pima Indians Diabetes Dataset**, publicly available on Kaggle :
+<https://www.kaggle.com/datasets/uciml/pima-indians-diabetes-database>, containing medical
+information of female patients belonging to Pima Indian heritage of age $\geq$ 21.
+
+It consist of several medical predictor variables:
+
+-   **Pregnancies**: Number of Times Pregnant (Int)
+
+-   **Glucose**: Plasma glucose concentration a 2 hours in an oral glucose tolerance test.
+
+    -   70-99 : Normal glucose level
+    -   100-125 : Impaired fasting\
+    -   126\> : Diabetes
+
+-   **BloodPressure**: Diastolic blood pressure (mm Hg):
+
+    -   \<84: Normal
+    -   84-89: High
+    -   90-99: Hypertensive I
+    -   100-109: Hypertensive II
+    -   110$\geq$ : Hypertensive III
+
+-   **SkinThickness**: Triceps skin fold thickness (mm)
+
+-   **Insulin**: 2-Hour serum insulin (mu U/ml)
+
+-   **BMI**: Body mass index (weight in kg/(height in m)\^2):
+
+    -   \<18.5 : Underweight
+    -   18.5 - 24.9 : Healthy\
+    -   25 - 29.9 : Overweight
+    -   30 - 39.9 : Obese
+
+-   **DiabetesPedigreeFunction**: Diabetes pedigree function
+
+-   **Age**: Patient Age (Years)
+
+For each patient, the binary target variable **Outcome** indicates whether or not she is affected by
+Diabetes.
+
+# Exploratory Data Analysis
+
+## Daling with missing data
+
+First, let's look for missing/inconsistent values in our data.
+
+```{r, echo = FALSE}
+df.summaries <- as.data.frame(apply(data[ , names(data) != "Outcome"], 2, summary))
+df.summaries['Missing Values',] <- colSums(is.na(data[ , names(data) != "Outcome"]))
+df.summaries['Zeros',] <- colSums(data[ , names(data) != "Outcome"] ==0 )
+
+
+
+knitr::kable(df.summaries, digits = 4)
+
+```
+
+  
+
+```{r, echo = FALSE}
+df.summaries[c('Zeros'),]$Pregnancies <-  0
+missing <- nrow(data)-as.numeric(df.summaries[c('Zeros'),])
+
+text <- paste0(round(as.numeric(df.summaries[c('Zeros'),])/nrow(data),2),'%')
+
+
+fig <- plot_ly( x = names(df.summaries), y = missing, type = 'bar',text = text,
+        marker = list(color = 'rgb(58,200,225)',
+                      line = list(color = 'rgb(58,200,225)',
+                                  width = 1.5))) %>% layout(title = "Missing Values: Counts and Percentage",
+         xaxis = list(title = ""),
+         yaxis = list(title = ""))
+
+fig
+```
+
+```{r, include = FALSE}
+
+data$Outcome <- as.factor(unlist(data$Outcome)) 
+data$Outcome <- factor(data$Outcome, levels=c("1", "0"), labels = c("Diabetic", "Healthy")) 
+
+
+perc.SkinThickness <- round(tail(df.summaries$SkinThickness, n = 1)/nrow(data),3)
+perc.Insulin <- round(tail(df.summaries$SkinThickness, n = 1)/nrow(data),3)
+
+data$SkinThickness <- NULL  
+data$Insulin <- NULL
+
+data0 <- data[which(data$Outcome == 'Healthy'),]
+data1 <- data[which(data$Outcome == 'Diabetic'),]
+features <- c( "Glucose", "BloodPressure" , "BMI" )
+
+for(i in 1:length(features)){
+  feature <- features[i]
+  feature_med0 <- median(as.numeric(unlist(data0[feature])))
+  feature_med1 <- median(as.numeric(unlist(data1[feature])))
+
+  data[feature][which(data[feature] == 0 & data$Outcome== 'Healthy'),] <- feature_med0
+  data[feature][which(data[feature] == 0 & data$Outcome== 'Diabetic'),] <- feature_med1
+}
+
+```
+
+There are no missing data, but several meaningless zero values, that we can consider as `NaN` (e.g.,
+BloodPressure = 0). So, we replaced the zeros with the per-class median in the following fields:
+
+-   Glucose
+-   BloodPressure
+-   BMI
+
+For what concerns the Skin Thickness and Insulin, the amount of missing values is respectively
+`r perc.SkinThickness` and `r perc.Insulin`. Hence, such replacement would be meaningless.
+Therefore, we removed those features.
+
+## Feature Distribution
+
+Here it is represented the Box Plot for all the features
+
+```{r, echo = FALSE, warning= F}
+colors = list('Diabetic' = '#39C9BB', 'Healthy'= '#ffbf00')
+
+fig <- plot_ly(stack(data[which(names(data)!= 'Outcome'),]), y = ~values, color = ~ind, type = "box")
+
+fig
+```
+
+## Univariate Analysis
+
+In the following, they are reported some plots representing the distribution of the different
+features. Please notice that the values reported refer to intra-class percentages, i.e., the counts
+are normalized by dividing for the carnality of the class they refer to. By doing so, we are able to
+compare the different categories regardless from the class unbalance of the data set.
+
+### Pregnancies
+
+```{r echo = FALSE}
+colors = list('Diabetic' = '#207068', 'Healthy'= '#98DDCA')
+
+ggplot(data=data, aes(x=Pregnancies)) + 
+                geom_bar(aes(y = ..prop.., fill = Outcome), position = 'dodge')+
+                scale_color_manual(values = c("Diabetic" = colors$Diabetic, "Healthy"=colors$Healthy))+
+                scale_fill_manual(values = c("Diabetic" = colors$Diabetic, "Healthy"=colors$Healthy))+
+  xlab('Pregnancies')+
+  ylab('Proportion')+
+  ggtitle(expression(italic('Number of Times Pregnant')))+
+  theme_minimal()+
+  theme(plot.title = element_text(size = 20 ))
+              
+```
+
+In this dataset, diabetes seems more common among women that had experienced many pregnancies.
+Although gestation per se cannot cause diabetes (except for gestational diabetes, which is a
+specific temporary condition), an high number of pregnancies can lead to an hormonal imbalance or
+weight gain, which may increase the risk of developing diabetes.
+
+### Age
+
+```{r echo = FALSE, warning=FALSE}
+colors = list('Diabetic' = '#BA6B57', 'Healthy'= '#F1935C')
+
+ggplot(data=data, aes(x=Age)) + 
+  geom_bar(aes(y = ..prop..,,  fill = Outcome), position ='dodge')+
+  scale_x_binned(n.breaks = 10)+
+    scale_color_manual(values = c("Diabetic" = colors$Diabetic,
+                                "Healthy"=colors$Healthy))+
+    
+    scale_fill_manual(values = c("Diabetic" = colors$Diabetic,
+                                "Healthy"=colors$Healthy))+
+  ggtitle(expression(italic('Age')))+
+  
+
+  xlab('Age')+
+  ylab('Proportion')+
+  theme_minimal()+
+  theme(plot.title = element_text(size = 20 ))
+```
+
+In this dataset, diabetes seems more common across people above age of 35; this is possibly because
+that Type I diabetes can arise at any age, while Type II diabetes is more common across people of
+age $\geq 40$.
+
+### Glucose
+
+```{r echo = FALSE, warning=FALSE}
+col =  list('Diabetic' = '#E88A1A', 'Healthy'= '#FFCC29')
+
+              
+plot.continuous <- function(feature,data, colors = col){
+  
+  h <- ggplot(data=data, aes(x=get(feature),fill = Outcome )) + 
+  geom_histogram( aes(y=..density..),bins = 30, alpha = 0.5)+
+      theme_minimal()+
+      theme(legend.position="none",aspect.ratio = 1)+
+  scale_color_manual(values = c("Diabetic" = colors$Diabetic,
+                                "Healthy"= colors$Healthy))+
+    
+    scale_fill_manual(values = c("Diabetic" = colors$Diabetic,
+                                "Healthy"=colors$Healthy))+
+    ylab('density')+
+    xlab(feature)
+  
+  d <- ggplot(data=data, aes(x=get(feature),fill = Outcome )) + 
+  geom_density(alpha = 0.2, aes(color = Outcome))+
+
+  geom_rug(aes(color = Outcome))+
+        theme_minimal()+
+
+  theme(legend.position=c(0,1.1),aspect.ratio = 1)+
+    ylab('')+
+    xlab(feature)+
+  
+  scale_color_manual(values = c("Diabetic" = colors$Diabetic,
+                                "Healthy"=colors$Healthy))+
+    
+    scale_fill_manual(values = c("Diabetic" = colors$Diabetic,
+                                "Healthy"=colors$Healthy))
+  
+  return(grid.arrange(h, d, ncol=2, top = textGrob(paste0(feature, ' distribution'),gp=gpar(fontsize=20,font=3))))
+
+  
+}
+
+plot.continuous('Glucose', data )
+
+glucose.level <- function(x)
+  {if (x<=99) {     out <- 'Normal' }
+  if ((99< x)*(x <=125)){out <- 'Impaired Fasting'}
+  if (x>124){out <- 'Diabetes'}
+  return(out)
+}
+
+glucose.level <- Vectorize(glucose.level)
+
+Diabetic <- table(glucose.level(data$Glucose)[which(data$Outcome=='Diabetic')])/length(which(data$Outcome=='Diabetic'))
+Healthy <- table(glucose.level(data$Glucose)[which(data$Outcome=='Healthy')])/length(which(data$Outcome=='Healthy'))
+
+df_gl <- melt(cbind(Diabetic,Healthy)) 
+
+names(df_gl) <- c('GlucoseLevel', 'Outcome','Value')
+df_gl$GlucoseLevel<-  factor(df_gl$GlucoseLevel,levels= c('Normal','Impaired Fasting','Diabetes'))
+
+plot_ly(data = df_gl,
+  y =  ~Value,
+  x = ~GlucoseLevel, 
+  color = ~Outcome,
+  type = 'bar',colors= c('#E88A1A','#FFCC29')
+  )%>% layout(title = "% of Patients for each class of Glucose Level")
+
+```
+
+Not surprisingly, diabetic people have an higher glycemic index, being this is one of the hillness'
+symptoms.
+
+### Blood Pressure
+
+```{r  echo = FALSE}
+col = list('Diabetic' = '#004f99' , 'Healthy'='#8ac7ff' )
+
+plot.continuous('BloodPressure', data)
+
+BloodPressure.level <- function(x)
+  {if (x<84) {     out <- 'Normal' }
+  if ((84<= x)*(x <=89)){out <- 'High'}
+  if ((90<= x)*(x <=99)){out <- 'Hypertensive I'}
+  if ((100<= x)*(x <=109)){out <-'Hypertensive II'}
+  if (x>=110){out <-'Hypertensive III'}
+  return(out)
+}
+
+BloodPressure.level <- Vectorize(BloodPressure.level)
+
+Diabetic <- table(BloodPressure.level(data$BloodPressure)[which(data$Outcome=='Diabetic')])/length(which(data$Outcome=='Diabetic'))
+Healthy <- table(BloodPressure.level(data$BloodPressure)[which(data$Outcome=='Healthy')])/length(which(data$Outcome=='Healthy'))
+
+df_bpl <- melt(cbind(Diabetic,Healthy)) 
+
+names(df_bpl) <- c('BloodPressure', 'Outcome','Value')
+df_bpl$BloodPressure<-  factor(df_bpl$BloodPressure,levels= c('Normal','High',
+                                                             'Hypertensive I',
+                                                             'Hypertensive II',
+                                                             'Hypertensive III'))
+
+plot_ly(data = df_bpl,
+  y =  ~Value,
+  x = ~BloodPressure, 
+  color = ~Outcome,
+  type = 'bar',colors=unlist(col, use.names = F)
+  ) %>% layout(title = "% of Patients for each class of Blood Pressure")
+```
+
+Diabetic people seem to suffer more from hypertension than non-diabetic patients. This may be due to
+the fact that some forms of diabetes (Type II) are associated with high weight, which on turn may
+cause high blood pressure.
+
+### Diabetes Pedigree Function
+
+```{r  echo = FALSE}
+col = list('Diabetic' = '#1A4D2E' , 'Healthy'='#7DCE13' )
+
+plot.continuous('DiabetesPedigreeFunction', data)
+```
+
+### Body Mass Index
+
+```{r echo = FALSE ,message = FALSE, warning= FALSE}
+col = list('Diabetic' = '#7A4069' , 'Healthy'='#CA4E79' )
+
+plot.continuous('BMI', data)
+
+BMI.level <- function(x)
+  {if (x<18.5) {     out <- 'Underweight' }
+  if ((18.5<= x)*(x <=24.9)){out <- 'Healthy'}
+  if ((25<= x)*(x <=29.9)){out <- 'Overweight'}
+  if (x>=30){out <-'Obese'}
+  return(out)
+}
+
+
+BMI.level <- Vectorize(BMI.level)
+
+Diabetic <- table(BMI.level(data$BMI)[which(data$Outcome=='Diabetic')])/length(which(data$Outcome=='Diabetic'))
+Healthy <- table(BMI.level(data$BMI)[which(data$Outcome=='Healthy')])/length(which(data$Outcome=='Healthy'))
+
+df_bmi <- melt(cbind(Diabetic,Healthy)) 
+
+names(df_bmi) <- c('BMI', 'Outcome','Value')
+df_bmi$BMI<-  factor(df_bmi$BMI,levels= c('Underweight','Healthy',
+                                                             'Overweight',
+                                                             'Obese'))
+
+plot_ly(data = df_bmi,
+  y =  ~Value,
+  x = ~BMI, 
+  color = ~Outcome,
+  type = 'bar',colors=unlist(col, use.names = F)
+  ) %>% layout(title = "% of Patients for each class of BMI")
+
+
+```
+
+Diabetes is more common among obese people; indeed obesity is one of the risk factor for developing
+Type II diabetes.
+
+## Correlation and Mulitcollinearity Check
+
+```{r echo = F}
+corr <- round(cor(data[,names(data) != 'Outcome']), 1)
+
+ggcorrplot(corr, hc.order = TRUE, type = "lower",
+   lab = TRUE, colors = c('#0C4B8E', 'white','#BF382A'))
+
+```
+
+The features in our dataset are weakly correlated, hence in the regression, there won't be
+Multicollinearity problems.
+
+## Multivariate analyisis
+
+```{r echo = FALSE}
+colors <- c('#72B2BA','#ffae42')
+multivariate.plot <- function(x,y){
+  fig <- plot_ly(
+    x = unlist(data[x]), 
+    y =unlist(data[y]) ,
+    color = data$Outcome, 
+    colors = colors)
+  fig <- fig %>% add_markers()
+  fig <- fig %>% layout(
+    scene = list(xaxis = list(title = x),
+                 yaxis = list(title = y)))
+  fig <- fig %>% layout(title = paste0(x, ' VS ',y),
+                        xaxis=list(title = x),
+                        yaxis=list(title = y))
+  fig
+
+}
+
+multivariate.plot('Glucose','BMI')
+```
+
+```{r  echo = F}
+multivariate.plot('Glucose','BloodPressure')
+```
+
+```{r echo = F}
+multivariate.plot('BloodPressure','BMI')
+
+
+```
+
+```{r echo = F}
+fig <- plot_ly(data, x = ~Glucose, y = ~BMI, z = ~BloodPressure, color = ~Outcome, colors = colors)
+fig <- fig %>% add_markers()
+fig <- fig %>% layout(scene = list(xaxis = list(title = 'Glucose'),
+                     yaxis = list(title = 'BMI'),
+                     zaxis = list(title = 'Blood Pressure')))
+fig <- fig %>% layout(title = "Glucose, Blood Pressure, BMI")
+
+fig
+```
+
+```{r echo = F}
+multivariate.plot('Age','Pregnancies')
+
+```
+
+Age and number of Pregancies are weakly Diabeticly correlated ($\rho \approx 0.5$ ). This is not
+surprising since elder women are more likely to have had an higher number of Pregnancies during
+their life.
+
+## Class distribution
+
+```{r echo = F}
+data.balance <- function(data, title){
+  balance_df <- as.data.frame(table(data$Outcome)) 
+  names(balance_df) <-c('Outcome','Count')
+  pie_chart <- plot_ly(balance_df, 
+                     type='pie',
+                     labels= ~Outcome,
+                     values=~Count, 
+               textinfo='label+percent',
+               marker = list(colors= unlist(colors)[c(1,2)]))  %>%  layout(title = title)
+
+  balance_df %>%
+    gt()
+  pie_chart
+    
+
+}
+
+data.balance(data, 'class proportion in the original dataset')
+
+```
+
+In order to overcome the severe class imalance of our data, we applied SMOTE: a data augmentation
+strategy consisting in oversampling the minority class (Diabetic in our case).
+
+```{r echo = F}
+set.seed(121)
+smote_sample <- SMOTE(data[,names(data)!= 'Outcome'], data$Outcome, dup_size = 1)
+
+data <- smote_sample$data
+
+data$Outcome <- data$class
+data <- data[,names(data)!= 'class']
+
+data$Pregnancies <- as.integer(data$Pregnancies)
+data$Age <- as.integer(data$Age)
+
+data.balance(data, 'class proportion after SMOTE')
+
+
+```
+
+Eventually we obtained a dataset with the same statistics as above, but more balanced!
+
+```{r include = FALSE}
+knitr::opts_chunk$set( warning = FALSE, message = FALSE,fig.align='center') 
+```
+
+# The Model
+
+We will use **Bayesian Logistic Regression** to model the relationship between the binary target
+variable $Y \in \{0,1\}$ (diabetic = 1, healthy = 0) with the input features
+$x_j\ \ ,\ \ \ j=1,...,p$:
+
+ - $x_1$ = #Pregnancies 
+ - $x_2$ = Glucose 
+ - $x_3$ = Blood Pressure 
+ - $x_4$ = Body Mass Index 
+ - $x_5$ = Diabetes Pedigree Function 
+ - $x_6$ = Age 
+
+```{r echo = FALSE}
+n.beta <- (ncol(data)-1)
+df <- data.frame(names(data), c(paste0("x", 1:n.beta),'Y'))
+names(df) <-  c('feature name','variable name')
+knitr::kable(df, digits = 4)
+
+```
+
+
+Moreover, in the following we will consider the canonical notation: $x_0=1$ in order to model the intercept. Differently from
+Bayesian linear regression, there is no variance term to be estimated, and only the regression
+parameters ($\beta_j$) will be estimated.
+
+For each patient, the target variable can be modeled as a Bernoulli:
+$$ Y|\boldsymbol{x} \sim Ber(\theta_{\boldsymbol{x}})$$ Hence: $$
+\Pr(Y = 1|\boldsymbol{x})  = \mathbb{E}[Y = 1|\boldsymbol{x}] = \theta_\boldsymbol{x}
+$$ In logistic regression, the Link function that links $\mathbb{E}[Y = 1|\boldsymbol{x}]$ with the
+linear predictor $\boldsymbol{\beta \cdot x} = \sum_{j} \beta_j \cdot x_j$ is the **Logit Function**:
+
+$$
+\theta_{\boldsymbol{x}} = \text{ilogit}\left(\boldsymbol{\beta \cdot x} \right) \iff \boldsymbol{\beta \cdot x} = \text{logit} \left(\theta_{x}\right) 
+$$
+
+where: $$
+\text{ilogit}\left(z\right) = \frac{\exp(z)}{1+\exp(z)}
+$$ is the *sigmoid function*, forcing $\boldsymbol{\beta \cdot x_i}$ in the $[0,1]$ range;
+
+and $$\text{logit}(\pi) = \log\left(\frac{\pi}{1-\pi}\right)$$ Is the *logit function* (inverse of
+the sigmoid) computing the logarithm of the odds.
+
+```{r echo = FALSE}
+sigmoid <- function(x) exp(x)/(1+exp(x))
+sigmoid.plot <-
+  ggplot() +
+  xlim(-10, 10) + 
+  geom_function(fun = sigmoid,colour = '#40E0D0',lwd=1.5)+
+  xlab('x')+
+  ylab('ilogit(x)')+
+  ggtitle(expression(italic('Sigmoid Function')))+
+  theme_minimal()+
+  theme(plot.title = element_text(size = 20 ))
+
+
+logit <- function(p) log(p/(1-p))
+logit.plot <-
+  ggplot() +
+  xlim(0, 1) + 
+  geom_function(fun = logit,colour = 'orange',lwd=1.5)+
+  xlab('p')+
+  ylab('logit(p)')+
+  ggtitle(expression(italic('Logit Function')))+
+  theme_minimal()+
+  theme(plot.title = element_text(size = 20 ))
+
+
+print(sigmoid.plot)
+print(logit.plot)
+
+
+```
+
+```{r echo = F}
+coord_dag <- list(
+  x = c(theta = 2, 
+        beta0 = 1, 
+        beta1 = 1, 
+        beta2 = 1,
+        beta3 = 1,
+        beta4 = 1 , 
+        beta5 = 1, 
+        beta6 = 1,
+        x = 2,
+        Y =3),
+  y = c(theta = 4,
+        beta0 = 1, 
+        beta1 = 2, 
+        beta2 = 3, 
+        beta3 = 4,
+        beta4 = 5,
+        beta5 = 6, 
+        beta6 = 7,
+        x = 6,
+        Y = 4)
+)
+
+dag_object <- ggdag::dagify(theta ~ beta0,
+                            theta ~ beta1,
+                            theta ~ beta2,
+                            theta ~ beta3,
+                            theta ~ beta4,
+                            theta ~ beta5,
+                            theta ~ beta6,
+                            theta ~ x,
+                             Y ~ theta, 
+                            coords = coord_dag)
+
+
+
+
+ggdag::ggdag(dag_object,text = F)+
+  geom_dag_point(aes(colour = c('Y',rep('par',8),NA))) +
+  geom_dag_text(parse = T,
+                label =c('Y',
+                         expression(beta[0]),
+                         expression(beta[1]),
+                         expression(beta[2]),
+                         expression(beta[3]),
+                         expression(beta[4]),
+                         expression(beta[5]),
+                         expression(beta[6]),
+                         expression(theta),
+                'x'))+
+  ggtitle(expression(italic('DAG representation')))+
+
+  theme_dag()+
+  theme(legend.position = 'none',
+        plot.title = element_text(size = 20 ))
+
+```
+
+#### Likelihood
+
+The overall dataset is randomly shuffled and sliced in Train and Test sets according to a 80/20
+split.
+
+-   The Training examples represent the observations in our Bayesian Analysis.
+-   The Test set will be used to measure the performances of our model and compare them with the
+    ones achieved by other classification ML techniques.
+
+Let's say we have $n$ observations; we can define their likelihood function as follows: 
+$$
+L_{\boldsymbol{y}}(\boldsymbol{\beta}, \boldsymbol{X}) = f(\boldsymbol{y}|\boldsymbol{\beta},\boldsymbol{X}) = \prod_{i= 1}^n f(y^{(i)}|\boldsymbol{\beta,x^{(i)}}) =  \prod_{i= 1}^n \text{ilogit}( \boldsymbol{\beta \cdot x^{(i)}}) ^{y^{(i)}}\left(1-\text{ilogit}( \boldsymbol{\beta \cdot x^{(i)}})\right)^{1-y^{(i)}} 
+$$ 
+
+#### Joint prior of the parameters
+
+The joint prior distribution of the parameters on $\mathbf{B}^p = \{(-\infty, +\infty)\}^{p}$ can be computed as the product of their marginal distributions:
+
+$$
+\pi(\boldsymbol{\beta}) = \prod_{j= 1}^{p}  \pi(\beta_j) = \pi(\beta_0)\cdot \pi(\beta_1)\cdot ...\cdot \pi(\beta_p)
+$$
+
+In our case we will consider two kind of priors, expressing our belief that each $\beta_j$ represents the true population characteristics (under our modellistic assumptions), prior to the observation of any data : 
+
+- Normal distribution:
+
+$$
+\boldsymbol{\beta} \sim N_p(\boldsymbol{\mu}, \mathbb{I}_p\sigma^2) \iff\beta_j \overset{iid}{\sim} N\left(\mu_j, \sigma_j^2= 10^4\right)  \  \  \ j = 1,..., p
+$$
+
+
+- Laplace distribution:
+
+
+$$
+\beta_j  \overset{iid}{\sim} \text{Laplace}\left(\mu_j,b_j =  \frac{10^2}{\sqrt2}\right) \  \  \ j = 1,..., p
+$$ 
+For what conernes the hyperparameters, we consider both Normal and Laplace distribution centered in 0 ($\mu_j = 0   \ , \ \ j = 1,..., p$) 
+Since we have weak prior knowledge, a diffuse prior distribution is used, spreading more or less
+evenly the probability distribution over $\beta_j$, which is modeled in terms of assigning an high variance to the prior:
+
+
+- Gaussian: $\sigma^2_j = 10^4  \ ,  \ \ j = 1,..., p$ .
+- Laplace: $b_j = \frac{10^2}{2} \iff \mathbb{V}\text{ar}(\beta_j)= 10^4  \ ,  \ \ j = 1,..., p$ .
+
+
+```{r echo =FALSE}
+
+normal.fun <- function(x) dnorm(x,sd = 10^2,mean  =0)
+normal.plot <-
+  ggplot() +
+  xlim(-100, 100) + 
+  ylim(0.0015, 0.05)+
+
+  geom_function(fun = normal.fun,colour = '#77D970',lwd=1.5)+
+  xlab('x')+
+  ylab('dnorm(x)')+
+  ggtitle(expression(italic('Normal Distribution ')))+
+  theme_minimal()+
+  theme(plot.title = element_text(size = 20 ))
+
+laplace.fun <- function(x) dLaplace(x, mu = 0 , b = 10^2/sqrt(2))
+laplace.plot <-
+  ggplot() +
+  xlim(-100, 100) +
+  ylim(0.0015, 0.05)+
+  geom_function(fun = laplace.fun,colour = '#FF0075',lwd=1.5)+
+  xlab('x')+
+  ylab('dLaplace(x)')+
+  ggtitle(expression(italic('Laplace Distribution ')))+
+  theme_minimal()+
+  theme(plot.title = element_text(size = 20 ))
+
+grid.arrange(normal.plot, laplace.plot, ncol=2)
+
+```
+
+We will then compare the Deviance Information Criterion of the two models to select the most fitting one.
+
+#### The Posterior
+
+In Bayesian inference we combine our prior beliefs about the model parameters - expressed in terms
+of prior distribution - with the likelihood of data. The Posterior distribution express our belief
+that $\beta_j$ is the true value, having observed the data. The engine that allow us to obtain the
+posterior distribution from the prior distribution is the Bayes Rule: 
+$$
+\text{Posterior} \propto \text{Prior}\times \text{Likelihood}
+$$ 
+
+$$
+\pi(\boldsymbol{\beta}|\boldsymbol{y,X}) \propto L_{\boldsymbol{Y}}(\boldsymbol{\beta,X})\times \pi(\boldsymbol{\beta}) = \\ \text{[Gaussian marginal priors]}\\ =\prod_{i= 1}^n \left(\frac{\exp( \boldsymbol{\beta \cdot x^{(i)}})}{1+\exp( \boldsymbol{\beta \cdot x^{(i)}}) }\right)^{y^{(i)}}
+ \left(1- \frac{\exp( \boldsymbol{\beta \cdot x^{(i)}})}{1+\exp( \boldsymbol{\beta \cdot x^{(i)}}) }\right)^{1-y^{(i)}}  \prod_{j=0}^{p} {\frac {1}{\sigma_{j} {\sqrt {2\pi }}}}\exp \left(-{\frac {1}{2}}{\frac {(\beta_j-\mu_j )^{2}}{\sigma_{j} ^{2}}}\right) \\ \text{[Laplace marginal priors]}\\
+ =\prod_{i= 1}^n \left(\frac{\exp( \boldsymbol{\beta \cdot x^{(i)}})}{1+\exp( \boldsymbol{\beta \cdot x^{(i)}}) }\right)^{y^{(i)}}
+ \left(1- \frac{\exp( \boldsymbol{\beta \cdot x^{(i)}})}{1+\exp( \boldsymbol{\beta \cdot x^{(i)}}) }\right)^{1-y^{(i)}}  \prod_{j=0}^{p} {\frac {1}{b_{j}}}\exp \left(-{\frac {1}{2}}{\frac {|\beta_j-\mu_j |}{\sigma_{j} ^{2}}}\right)
+$$ 
+
+
+#### Full Conditionals
+
+Now, let's derive the full conditionals
+In the Gaussian Prior case, this is equal to: 
+$$
+ \pi(\beta_j|\boldsymbol{y,X,\beta_{(-j)}}) \propto \pi(\boldsymbol{y}|\boldsymbol{X,\beta}) \pi(\beta_j) =  \prod_{i= 1}^n 
+ \left(\frac{\exp( \boldsymbol{\beta \cdot x^{(i)}})}{1+\exp( \boldsymbol{\beta \cdot x^{(i)}}) }\right)^{y^{(i)}}
+ \left(1- \frac{\exp( \boldsymbol{\beta \cdot x^{(i)}})}{1+\exp( \boldsymbol{\beta \cdot x^{(i)}}) }\right)^{1-y^{(i)}} \cdot {\frac {1}{\sigma_{j} {\sqrt {2\pi }}}}\exp \left(-{\frac {1}{2}}{\frac {(\beta_j-\mu_j )^{2}}{\sigma_{j} ^{2}}}\right)
+$$
+
+In the Laplace Prior case, this is equal to: 
+$$ 
+\pi(\beta_j|\boldsymbol{y,X,\beta_{(-j)}}) \propto \pi(\boldsymbol{y}|\boldsymbol{X, \beta}) \pi(\beta_j)= \prod_{i=1}^{n}
+\left(\frac{\exp( \boldsymbol{\beta \cdot x^{(i)}})}{1+\exp( \boldsymbol{\beta \cdot x^{(i)}})}\right)^{y^{(i)}}\left(1-\frac{\exp( \boldsymbol{\beta \cdot x^{(i)}})}{1+\exp(\boldsymbol{\beta \cdot x^{(i)}}) }\right)^{1-y^{(i)}} \cdot{\frac {1}{2b_{j}}}\exp \left(-{\frac {|\beta_j-\mu_{j} |}{b_{j}}}\right)
+$$ 
+
+Both distributions do not belong to any known parametric families; hence, it is not possible to
+directly draw i.i.d. simulations from them in order to provide estimates for $\boldsymbol{\beta}$;
+we will hence rely on **Markov Chain simulations** to obtain estimates for the unknown parameters.
+
+
+## Metropolis-within-Gibbs algorithm
+
+### Gibbs Sampling
+Gibbs sampling is an algorithm aimed to simulate a suitable Markov Chain:
+
+1. START : We start at time $t=0$ with a fixed initial point $\beta_j^{0}=x^{(0)}=(x_1,…,x_k)$
+2. ITERATE: 	For $j=1,..,p$:
+
+$$
+\beta_{j}^{(t+1)} = \pi\left(\beta_{j}|\boldsymbol{\beta_{(-j)}}\right) = \pi\left(\beta_{j} |\beta_0^{(t+1)}, \beta_{1}^{(t+1)}, ..., \beta_{j-1}^{(t+1)}, \beta_{j+1}^{(t)},...,\beta_{p}^{(t)} \right)
+$$
+
+
+This per se does not provide a strictly stationary Markov Chain, but:
+
+* If we start $X_0\sim \pi(\cdot)$, then the Markov Chain is strictly stationary
+* If we wait for a suitable time, then the Markov Chain is approximately stationary
+
+We can look at each update - which is temporary within the Gibbs cycle - as a transition from one state to another.
+
+$$
+\beta_j^{(t+1)} = \pi \left(\beta_j |\boldsymbol{\beta_{(-j)}}\right) \rightarrow K_j
+$$
+
+
+### Metropolis Hastings
+Metropolis-Hastings consists in building a Markov Chain by iteratively draw a candidate $Y_{t+1}=y$ from a proposal distribution $p_x(y)$ - which depends on the current state of the chain $X_{t}=x$ - and decide weather accept it as next state of the chain or remain in the current state $x$.
+Hence, the next state of the chain:
+$$
+X_{t+1} = 
+\begin{cases}
+y  \ \ \text{   with probability }\ \ \  \ \ \ \ \ \         \alpha(x,y)\\
+x  \  \  \text{   with probability   } \    1- \alpha(x,y)
+\end{cases}
+$$
+where:
+$$
+\alpha(x,y) = \min\left\{1,\frac{\pi(y)}{\pi(x)}\frac{p_y(x)}{p_x(y)}\right\}
+$$
+
+### Metropolis-within-Gibbs sampling
+
+Gibbs sampling is a special case of Metropolis algorithm, in which the new proposal is accepted with probability 1.
+It requires to recognize the full conditionals, which is not our case since any of the $\beta_j$ belong to a well-known parametric family. 
+In this case we can apply a Metropolis-within-Gibbs algorithm, which consists in replacing the Kernel $K^{GS}$ from which we are not able to directly simulate in the Gibbs Sampling with the kernel of the Metropolis $\tilde{K}^{MH}$, having as target density the full conditional of $\beta_j$.
+
+
+
+
+```{r echo = FALSE}
+data$Outcome <- as.numeric(ifelse(data['Outcome']== 'Diabetic', 1, 0))
+names(data) <- c(paste0("x", 1:n.beta),'Y')
+```
+
+```{r include=FALSE}
+
+#UTILITIES
+compute.errors <- function(jags.mod){
+  parameters <- jags.mod$parameters.to.save
+  n.beta <- length(parameters)
+  IFiid <- rep(NA, n.beta)
+  ESS <- rep(NA, n.beta)
+  MCMCerror <- rep(NA,n.beta)
+  MCSEerror <- rep(NA,n.beta)
+  for(i in 1:n.beta){
+    beta <- parameters[i]
+    IFiid[i] <- var(jags.mod$BUGSoutput$sims.array[,1,beta])/length(jags.mod$BUGSoutput$sims.array[,1,beta])
+    ESS[i] <-   LaplacesDemon::ESS(jags.mod$BUGSoutput$sims.array[,1,beta])
+    MCMCerror[i] <- var(jags.mod$BUGSoutput$sims.array[,1,beta])/ESS[i]
+    MCSEerror[i] <- LaplacesDemon::MCSE(jags.mod$BUGSoutput$sims.array[,1,beta])
+
+}
+  variances <- data.frame(ESS = ESS,IFiid = IFiid,  MCMCerror = MCMCerror, MCSEerror= MCSEerror, row.names = parameters)
+  return(variances)
+}
+
+
+
+
+
+```
+
+
+```{r echo = FALSE}
+## Train-Test Split
+
+set.seed(121)
+n <- nrow(data)
+
+train.perc <- 0.8
+test.perc <- 1-train.perc
+
+train.n <- as.integer(train.perc*n)
+test.n <- n- train.n
+
+idx <- sample(1:n, replace = F)
+
+train.idx <- idx[1:train.n]
+test.idx <- idx[(train.n+1):n]
+
+
+train.data <- data[train.idx,]
+test.data <- data[test.idx,] 
+
+# Preparing the data for the model
+train<- as.list(train.data)
+train$N <- train.n
+
+```
+
+## Jags Models
+
+```{r include=FALSE}
+parameters <- paste0('beta', 0:n.beta)
+
+```
+
+### Normal
+
+    model 
+    {
+      for (i in 1:N){
+        Y[i] ~ dbern(p[i])
+        p[i] <- ilogit(beta0+beta1*x1[i] + beta2*x2[i] + beta3*x3[i] + beta4*x4[i] + beta5*x5[i] + beta6*x6[i])
+        
+      }
+      
+      # Defining the prior beta parameters
+      beta0 ~ ddexp(0, 1.0E-4)
+      beta1 ~ ddexp(0, 1.0E-4)
+      beta2 ~ ddexp(0, 1.0E-4)
+      beta3 ~ ddexp(0, 1.0E-4)
+      beta4 ~ ddexp(0, 1.0E-4)
+      beta5 ~ ddexp(0, 1.0E-4)
+      beta6 ~ ddexp(0, 1.0E-4)
+
+    }
+
+```{r  include = F}
+
+diabetesjagsfit.normal <- jags(data=train,
+                   parameters.to.save=parameters,
+                   model.file="jags-model-normal",
+                   DIC = T,
+                   n.chains=3,
+                   n.iter=10000,
+                   n.burnin = 2000)
+
+jags.mod <- diabetesjagsfit.normal
+
+
+```
+
+
+```{r echo = F}
+knitr::kable(jags.mod$BUGSoutput$summary, digits = 4)
+knitr::kable(data.frame(DIC = jags.mod$BUGSoutput$DIC, pD = jags.mod$BUGSoutput$pD) , digits = 4)
+
+```
+
+
+### Laplace
+
+    #  MODEL SPECIFICATION 
+
+    model 
+    {
+      for (i in 1:N){
+        Y[i] ~ dbern(p[i])
+        p[i] <- ilogit(beta0+beta1*x1[i] + beta2*x2[i] + beta3*x3[i] + beta4*x4[i] + beta5*x5[i] + beta6*x6[i])
+        
+      }
+      
+      # Defining the prior beta parameters
+      beta0 ~ ddexp(0, 1.0E-4)
+      beta1 ~ ddexp(0, 1.0E-4)
+      beta2 ~ ddexp(0, 1.0E-4)
+      beta3 ~ ddexp(0, 1.0E-4)
+      beta4 ~ ddexp(0, 1.0E-4)
+      beta5 ~ ddexp(0, 1.0E-4)
+      beta6 ~ ddexp(0, 1.0E-4)
+
+    }
+
+```{r include = F}
+set.seed(123)
+diabetesjagsfit.laplace <- jags(data=train,
+                   parameters.to.save=parameters,
+                   model.file="jags-model-laplace",
+                   DIC = T,
+                   n.chains=3,
+                   n.iter=10000,
+                   n.burnin = 2000)
+
+
+jags.mod <- diabetesjagsfit.laplace
+
+
+```
+```{r echo = F}
+knitr::kable(jags.mod$BUGSoutput$summary, digits = 4)
+knitr::kable(data.frame(DIC = jags.mod$BUGSoutput$DIC, pD = jags.mod$BUGSoutput$pD) , digits = 4)
+```
+
+
+The 95%-CI for $\beta_3$ in both models contains the zero, hence the parameter does not matter in
+our analysis in the relation between the covariates and the outputs. Let's have a look to the model
+if we remove the variable $x_3$ = **Blood Pressure**:
+
+### Normal Removing Null features
+
+```{r include = F}
+set.seed(123)
+
+parameters.no3 <- parameters[!(parameters%in% c( 'beta3'))]
+
+
+diabetesjagsfit.normal.no3 <- jags(
+  data=train[!(names(train) %in% c('x3'))] ,
+                   parameters.to.save=parameters.no3,
+                   model.file="jags-model-normal-no3",
+                   DIC = T,
+                   n.chains=3,
+                   n.iter=15000,
+                   n.burnin = 2000)
+jags.mod <- diabetesjagsfit.normal.no3
+
+```
+```{r echo = F}
+knitr::kable(jags.mod$BUGSoutput$summary, digits = 4)
+knitr::kable(data.frame(DIC = jags.mod$BUGSoutput$DIC, pD = jags.mod$BUGSoutput$pD) , digits = 4)
+
+```
+
+### Laplace Removing Null features
+
+```{r include = F}
+set.seed(123)
+
+diabetesjagsfit.laplace.no3 <- jags(
+  data=train[!(names(train) %in% c('x3'))] ,
+                   parameters.to.save=parameters.no3,
+                   model.file="jags-model-laplace-no3",
+                   DIC = T,
+                   n.chains=3,
+                   n.iter=15000,
+                   n.burnin = 2000)
+
+jags.mod <- diabetesjagsfit.laplace.no3
+```
+
+```{r echo = F}
+knitr::kable(jags.mod$BUGSoutput$summary, digits = 4)
+knitr::kable(data.frame(DIC = jags.mod$BUGSoutput$DIC, pD = jags.mod$BUGSoutput$pD) , digits = 4)
+
+```
+
+
+The criterion used for selecting the best model is the *Deviance Information Criterion* (**DIC**): a comparative index used for choosing among competing models.
+It is a measure of *goodness of fit* of the model (average deviance), discounted by a penalization term,representing the number of parameters (**pD**):
+
+$$
+DIC = p_D+ \hat{D}_{\text{avg}}(\theta)
+$$
+where: 
+
+$$\hat{D}_{\text{avg}}(\theta) \approx \frac{1}{M} \sum_{i=1}^M -2 \log\left(f\left(y|\theta^{(j)}\right) \right) $$
+
+The model with the smallest DIC assumes Normal Priors and excludes the variable `x3`; hence, the following analysis will be referred to such setup.
+
+## Normal Model (without  **x3**)
+
+- **Traceplot**: The traceplots allow to assess the convergence of the markov chain by showing the time series of the chain. All chains seem to be exploring the same region of parameter values, which is a good sign. The expected outcome is to observe a stationary behavior after a number of transitions, which translates into regular oscillation within a certain range due to the chain reaching the target distribution.
+
+- **Density plot**: Depicts the simulated sampling distribution of the parameters, for each chain. The yellow vertical line represents the empirical mean, while the horizontal one the 95% quantile based credible interval based on the joint results of all of the three chains.
+
+- **Autocorrelation Function Plot** : The Auto Correlation Function(ACF) plots visualize how much the correlation between the simulated values holds in the previous states.
+   
+   -   On the $x$-axis we have the Lag $h$
+   -   On the $y$-axis it's reported $\rho(h)$, estimate of the correlation among coordinates in the stochastic process which is thought to be stationary: $\mathbb{C}\text{orr}(\beta_t,\beta_{(t+h)} )$
+
+If the process becomes stationary, we expect the correlation to vanish as we increase the lag $h$.
+In the limit, if $\rho=0$ the simulations are iid (which of course is not our case).
+
+
+```{r echo=FALSE,message = F, warning = F, fig.width=12,fig.height=2,fig.align='center'}
+
+
+betas <- parameters.no3
+colors =   hue_pal()(length(betas))
+
+mcmc.plots <- function(jags.mod,beta){
+  i <- as.numeric(substring(beta, nchar(beta),nchar(beta)))
+  df <- data.frame(beta=jags.mod$BUGSoutput$sims.array[,,beta])
+  names(df) <- paste0('Chain',1:3)
+  df <- melt(df)
+  names(df) <- c('chain','beta')
+  df$iteration <- rep(seq(2001,15000,by=13),3)
+
+  p1<-ggplot()+
+    geom_line(aes(x = df$iteration, y = df$beta, color = df$chain),
+      lwd=0.5)+
+    xlab('Iteration')+
+    ylab(bquote(beta[.(i)]))+
+    ggtitle(bquote(Trace~plot~of~ beta[.(i)]))+
+    theme_minimal()+
+    theme(plot.title.position = 'plot', 
+          plot.title = element_text(hjust = 0.5),
+          legend.position= "none")
+    
+  
+  p2 <- ggplot( ) +
+    geom_density(data = df, aes(beta, fill=chain,color = chain)
+                 ,alpha=.3, position="identity")+
+     geom_vline(xintercept = unlist(jags.mod$BUGSoutput$mean[beta],use.names =   F),
+                linetype="dotted", 
+                color = "orange", size=1.5)+
+    geom_segment(aes(x=jags.mod$BUGSoutput$summary[beta,'2.5%'],
+                     y = 0 , 
+                     xend= jags.mod$BUGSoutput$summary[beta,'97.5%'],
+                     yend= 0 ), 
+                  color = "orange", size=1.5)+
+    geom_point(aes(x=jags.mod$BUGSoutput$summary[beta,'2.5%'], y=0), colour="orange")+
+    geom_point(aes(x=jags.mod$BUGSoutput$summary[beta,'97.5%'], y=0), colour="orange")+
+    xlab(bquote(beta[.(i)]))+
+    ylab('Density')+
+    ggtitle(bquote(Density~plot~of~ beta[.(i)]))+
+    theme_minimal()+
+    theme(legend.title = element_blank())
+
+  
+  p3 <- ggacf(jags.mod$BUGSoutput$sims.array[,1,beta])+
+    geom_segment(lineend = "butt")+
+    geom_hline(yintercept = 0)+
+    ggtitle(bquote(ACF~of~ beta[.(i)]))+
+    theme_minimal()
+
+  return(ggarrange(p1,p2,p3,ncol = 3))
+
+  }
+
+  
+
+mcmc.plots(diabetesjagsfit.normal.no3,'beta0')
+mcmc.plots(diabetesjagsfit.normal.no3,'beta1')
+mcmc.plots(diabetesjagsfit.normal.no3,'beta2')
+mcmc.plots(diabetesjagsfit.normal.no3,'beta4')
+mcmc.plots(diabetesjagsfit.normal.no3,'beta5')
+mcmc.plots(diabetesjagsfit.normal.no3,'beta6')
+
+
+
+```
+
+
+
+### Running Mean
+
+One of the main goals of performing MCMC is to approximate quantities which are functionals of the
+target distribution $\pi(\cdot)$, such as the empirical mean: 
+$$
+I = \mathbb{E}_{\pi}[\beta_{j}] \approx \hat{I_t}= \sum_{i=1}^t\frac{\beta_{i}}{t}
+$$
+
+Where we assume the sample $\beta_{j}^{(1)}, ..., \beta_{j}^{(t)}$ to be simulated from suitable
+Markov Chain: invariant w.r.t. $\pi(\cdot)$. Such condition is satisfied either (i) by considering
+as starting distribution the stationary distribution or (ii) - under the regularity conditions make
+the ergodic behavior (SLL) possible - by taking only the samples following the burn-in time $T_0$, a
+suitable time such that $\beta_{j}^{(T_0-1)} \approx \pi(\cdot)$.
+
+```{r  echo = F, fig.width=12,fig.height=12,fig.align='center'}
+
+
+to.ggs <- function(jags.mod){
+  return(ggs(as.mcmc(jags.mod)))
+}
+
+Runningplot <- function(jags.mod){
+  jags.mod.ggs <- to.ggs(jags.mod)
+  g <- ggs_running(jags.mod.ggs, greek = T)+
+    geom_line(lwd  = 2)+
+    theme(legend.position="none")+
+    theme_bw()
+
+  return(g)
+}
+
+
+Runningplot(diabetesjagsfit.normal.no3)
+```
+
+By looking the plots we can see that the line that quickly approaches the overall mean. The point in
+which this happens is precisely the burn-in time.
+
+### Posterior uncertainty
+
+As criterion to establish the parameter with the larges the posterior uncertainty, we can look at the width of the quantile-based credible intervals (95%):    
+
+```{r echo = F}
+
+LB.q = diabetesjagsfit.laplace.no3$BUGSoutput$summary[,'2.5%'][1:length(parameters.no3)]
+UB.q = diabetesjagsfit.laplace.no3$BUGSoutput$summary[,'97.5%'][1:length(parameters.no3)]
+
+LB.hpd <- list()
+UB.hpd <- list()
+for(i in 1:length(parameters.no3)){
+  beta <- parameters.no3[i]
+  m <- matrix(diabetesjagsfit.laplace.no3$BUGSoutput$sims.array[,,beta],ncol = 1)
+  hpd_ <- emp.hpd(m)
+  LB.hpd[beta] = hpd_[1]
+  UB.hpd[beta] = hpd_[2]
+
+}
+
+q.ci <- data.frame(
+  'Quantile Based LB' =  LB.q,
+  'Quabtile Based UB' = UB.q,
+  'Width'= abs(LB.q-UB.q))
+
+hpd.ci <- data.frame(
+  'HPD Based LB' =  unlist(LB.hpd),
+  'HPD Based UB' =  unlist(UB.hpd),
+  'Width'= abs(unlist(LB.hpd)-unlist(UB.hpd)))
+
+knitr::kable(q.ci, digits = 4,  caption = 'Quantile Based', col.names = c('LB', 'UB', 'width'))
+
+knitr::kable(hpd.ci, digits = 4,  caption = 'Highest Posterior Density', col.names = c('LB', 'UB', 'width'))
+```
+ 
+As we can notice, in both cases the parameter associated to the widest credible interval is the intercept: $\beta_0$.
+
+### Correlation between parameters
+
+```{r echo=FALSE, message=FALSE,warning=FALSE}
+ggs_crosscorrelation(to.ggs(diabetesjagsfit.normal.no3), family= 'beta')+
+  theme_minimal()
+
+ggs_pairs(to.ggs(diabetesjagsfit.normal.no3),family = 'beta')
+```
+
+The most correlated couple of parameters is $\beta_4$ and $\beta_0$.
+
+### Errors
+
+The empirical mean is an unbiased estimator; therefore the MSE is equal to its variance. Differently from the Vanilla Monte Carlo case, in which the estimate are computed on iid samples, in the MCMC each realization of the sample depends on the previous one, which on turns depend on its prior and so on.. As a consequence, the variance of the empirical mean of the simulated values cannot be
+computed as the simulated values divided by the number of simulations, but we must take into account
+the covariance between each pair of simulated values. The higher the correlation, the larger will be the variance of the approximation provided by the MCMC algorithm with respect to the variance of the
+iid simulations proper of the MC method. This implies that the Markov Chain is more inefficient than standard iid simulation. This can be quantified by the effective sample size (ESS): 
+
+$$
+t_{eff}=\frac{t}{\left(1+2\sum_{k=1}^{+\infty} \rho_k \right)}
+$$
+
+Used to normalize the variance of $h(\beta_j)$ and get the variance of $\hat{I}_t$:
+
+$$
+\sigma^2_{\hat{I}_t}  = \mathbb{V}\text{ar}[\hat{I}_t] =\frac{\mathbb{V}\text{ar}_{\pi}(h(\beta_j))}{t_{eff}}  =  \frac{1}{\left(1+2\sum_{k=1}^{+\infty} \rho_k \right)} \cdot \frac{\sigma^2}{t}
+$$
+
+Another estimate of the inaccuracy of the MC samples is the *Monte Carlo Standard Error* (MCSE). It
+measures the standard deviation around the posterior mean of the samples due to the uncertainty of
+the MCMC algorithm.
+
+```{r echo = F,message = F, warning=F}
+knitr::kable(compute.errors(diabetesjagsfit.normal.no3) , digits = 4)
+
+```
+
+## Model Diagnostics
+
+In the following they are reported some Convergence Diagnostics, aimed at verifying the presence of
+converge issues, which might suggest to enlarge the number of simulations or use some other types of
+parametrizations.
+
+```{r echo = F}
+coda.fit <- coda::as.mcmc(diabetesjagsfit.normal.no3)
+```
+
+### Gelman-Rubin Diagnostic
+
+Gelman-Rubin diagnostic evaluates the convergence by analyzing the difference between multiple Markov chains. 
+Let:
+
+- $M$ : Number of chians
+- $T$: Number of iterations for each chain.
+
+For each parameter, we compare the between-chains and within-chain estimated variances; large differences between them indicate nonconvergence.
+
+-   Between-chain variance: 
+$$
+B_T = \frac{1}{M}  \sum_{m=1}^M (\hat{I}^{(m)} - \hat{I}_T)^2
+$$
+-   Within-chain variance:
+
+$$
+W_T  = \frac{1}{M}  \sum_{m=1}^3 \left[ \frac{1}{T} \sum_{t=1}^T \left(h\left(\beta_t^{(m)}\right) -\hat{I}_T^{(m)}\right ) \right]
+$$
+
+where:
+
+-   $\hat{I}_T^{(m)} = \frac{1}{T} \sum_{t=1}^{T} h\left(\beta_t^{(m)}\right)$
+-   $\hat{I_T}$ is the overall estimator using the values coming from all of the $M$ chains 
+
+Based on these measures, we compute the Potential Scale Reduction factor:
+$$
+\hat{R_T} = \sqrt{ \frac{T-1}{T} W_T + \frac{B_T}{n}}
+$$
+
+The model is healthy if $\hat{R}_T \approx 1$ and is below some threshold (usually $\hat{R}_T < 1.1$). 
+
+```{r  echo = F}
+df_gelman1 <- data.frame(coda::gelman.diag(coda.fit)[[1]])
+df_gelman2 <- data.frame(coda::gelman.diag(coda.fit)[[2]])
+
+names(df_gelman1) <- c('Point Estimate', 'Upper CI')
+names(df_gelman2) <- c('Multivariate PSRF')
+
+knitr::kable(df_gelman1,digits=3, caption = 'Gelman-Rubin diagnostic' )
+knitr::kable(df_gelman2,digits=3 )
+
+coda::gelman.plot(coda.fit)
+
+```
+
+### Geweke Diagnostics
+Geweke Diagnostics consists in an inter chain convergence check. 
+Compares the first 20% of the chain after burnin with the half last 50% percent; If the samples are drawn from the stationary distribution of the chain, the two means are equal and Geweke's statistic has an asymptotically standard normal distribution.
+The test statistic is a standard Z-score, calculated under the assumption that the two parts of the chain are asymptotically independent:
+$$
+Z = \frac{\hat{\beta}_A-\hat{\beta}_B}{\frac{1}{T_A}\hat{S}^{A}_{\beta}(0)+\frac{1}{T_B}\hat{S}^{B}_{\beta}(0)}
+$$
+where $A$,$B$ are two windows within the Markov chain and the standard error is estimated from the spectral density at zero and so takes into account any autocorrelation.
+If $|Z|<1.96$ we accept the null hypothesis.
+
+
+```{r echo = F}
+g<-coda::geweke.diag(coda.fit,frac1 = 0.2, frac2 = 0.5)
+df_gweke<-cbind(g[[1]]$z,g[[2]]$z,g[[3]]$z)
+colnames(df_gweke)<-c('Chain 1','Chain 2','Chain 3')
+
+
+knitr::kable(df_gweke,digits=3, caption = 'Z-scores for Geweke diagnostic' )
+
+```
+
+
+### Heidelberg & Welch diagnostics
+
+Uses a test statistic to verify the null hypothesis that the values sampled from the Markov Chian come from a stationary distribution.
+It composes of two parts:
+
+1. Stationary Test: 
+
+    i. Define an $\alpha$ level. 
+    ii. Test he null hypothesis that the chain is from a stationary distribution by calculating the Cramer-von-Mises statistic on the whole chain. 
+    iii. If the null hypothesis is rejected, then discard the first 10% of the chain. 
+    iv. Repeat the test, each time discarding the next 10% in case of rejection, until either the null hypothesis is accepted or 50% of the chain is discarded. If the test still rejects the null hypothesis, then the chain fails the test and needs to be run longer.
+
+ 
+2. Halfwidth Test: If the chain passes the first part of the diagnostic, then the part of the chain that was not discarded from the first part is used to test the second part.
+
+
+```{r echo = F}
+heidel<-coda::heidel.diag(coda.fit)
+
+heidel.formatting <- function(i){
+  df_heidel <- data.frame(heidel[[i]][,])
+  df_heidel[,1] <- ifelse(df_heidel[,1]==1,'pass','fail')
+  df_heidel[,4] <- ifelse(df_heidel[,4]==1,'pass','fail')
+  names(df_heidel) <- c('Stationarity test','start iteration','p-value','Halfwidth test','Mean','Halfwidth')  
+  return(df_heidel)
+  
+}
+
+knitr::kable(heidel.formatting(1),digits=3, caption = 'Chain 1' )
+knitr::kable(heidel.formatting(2),digits=3, caption = 'Chain 2')
+knitr::kable(heidel.formatting(3),digits=3, caption = 'Chain 3')
+
+```
+
+# Validation
+
+In order to validate our model, we can create, through simulation, a synthetic dataset from a distribution whose parameters ($\beta$'s) are fixed and thus, known. 
+Then, we check if it is able to recover the true population parameters by applying it to the simulated data.
+
+- we use as feature distribution the empirical distribution of our data's features;hence, the synthetic dataset is obtained by sampling with replacement from the original one 2000 times.
+- we use as fixed coefficients the $\beta$s returned from the frequentistic logistic regression applied to the original dataset.
+
+
+```{r include = F, echo = F}
+set.seed(125)
+glm.model <- glm(formula = Y ~ ., 
+                 family = binomial(link = "logit"), 
+                 data = train.data[!names(test.data)%in%c('x3')])
+
+sim.n <- 2000
+
+features.names <- paste0('x',c(1,2,4:6))
+
+sim.B <- array(glm.model$coefficients)
+
+sim.X <- matrix( nrow = sim.n, ncol = length(features.names))
+
+for(i in 1:length(features.names)){
+  sim.X[,i] <- sample(unlist(data[features.names[i]]),sim.n,replace = T)
+}
+
+sim.data <- data.frame(sim.X)
+
+# add the dummy variable
+sim.X <-cbind(rep(1,sim.n), sim.X)
+
+names(sim.data) <- features.names
+
+sim.data$Y <- rbinom(sim.n, size = 1, prob = sigmoid(sim.X%*%sim.B))
+sim.data <- as.list(sim.data)
+sim.data$N <- sim.n
+
+
+sim.jags <- jags(  data=sim.data ,
+                   parameters.to.save=parameters.no3,
+                   model.file="jags-model-normal-no3",
+                   DIC = T,
+                   n.chains=3,
+                   n.iter=15000,
+                   n.burnin = 2000)
+
+
+
+validation.results <- data.frame(
+  'validation recovered'= unlist(sim.jags$BUGSoutput$mean)[1:(length(features.names)+1)],
+  'fixed parameters' = sim.B,
+  'ratio' = sim.B/unlist(sim.jags$BUGSoutput$mean)[1:(length(features.names)+1)]
+
+
+)
+
+```
+
+```{r echo = FALSE}
+knitr::kable(validation.results,digits=3 ,col.names = c('simulation parameters', 'fixed parameters','ratio'))
+
+```
+
+
+As we can notice, the approximation ratio is $\approx 1$ for almost all the features.
+We can conclude that the model is able to recover the true parameter and confirm its adequacy.
+
+
+# Evaluation
+
+We want to test our model by evaluating its predictive performances over new observations (test data); 
+
+
+```{r include = F}
+## Prediction
+
+sigmoid <- function(x) 1/(1+exp(-x))
+
+jags.prediction <- function(d,p = 0.5, jags.mod = diabetesjagsfit.normal.no3){
+  n <- (length(jags.mod$parameters.to.save)-1)
+  B <- as.numeric(jags.mod$BUGSoutput$mean)[1:n]
+  X <- cbind(rep(1,length(d$x1)), d[which(names(d)!='Y')])
+  X <- data.matrix(X)
+  Y_pred <-ifelse(sigmoid(X%*%B)>p,1,0)
+  return(list('Y_pred'= Y_pred,'scores'= sigmoid(X%*%B)))
+}
+
+Y_pred.jags <- jags.prediction(test.data[!names(test.data)%in%c('x3')])$Y_pred
+scores.jags <- jags.prediction(test.data[!names(test.data)%in%c('x3')])$scores
+
+### GLM Frequentistic Framework
+
+
+
+Y_pred.glm <- ifelse(predict(glm.model,newdata=subset(test.data,type='response'))> 0.5,1,0)
+
+### Random Forest
+
+rf.model <- randomForest(as.factor(Y) ~ ., 
+                         data=train.data[!names(test.data)%in%c('x3')])
+
+Y_pred.rf <- factor(predict(rf.model, test.data), levels=c("1", "0"), labels = c(1,0)) 
+
+
+### Support Vector Classifier
+
+svm.model <- svm(formula = Y ~ .,
+                 data = train.data[!names(test.data)%in%c('x3')],
+                 type = 'C-classification',
+                 kernel = 'linear')
+
+Y_pred.svm = predict(svm.model, newdata = test.data)
+```
+
+## Compare the metrics
+
+Here they are reported the results of our Bayesian Logistic Regression Classifier,with the canonical cut-off level = 0.5, compared to the ones obtained by using different Machine Learning models, namely:
+
+- Frequentistic Logistic Regression 
+- Random Forest
+- Support Vector Classifier
+
+```{r echo=FALSE}
+
+n.models <- 4
+
+mod.eval <- function(Y_pred,Y_true = test.data$Y){
+  accuracy  <- Accuracy(Y_pred, Y_true)
+  precision <- Precision(Y_pred, Y_true)
+  recall    <- Recall(Y_pred, Y_true)
+  f1.score  <- F1_Score(Y_pred, Y_true)
+  return(c(accuracy, precision, recall, f1.score))
+}
+
+Results <- data.frame(
+  Bayesian_LR      = mod.eval(Y_pred.jags),
+  Frequentistic_LR = mod.eval(Y_pred.glm),
+  RandomForest     = mod.eval(Y_pred.rf),
+  SVM              = mod.eval(Y_pred.svm),
+  row.names = c('**Accuracy**','**Precision**','**Recall**','**F1-score**')
+)
+
+
+knitr::kable(Results)
+
+```
+As we can notice, Random Forest is the best performing model; nevertheless, our Bayesian Logistic Regression has an accuracy higher than both Frequentistic Logistic Regression and Support Vector Classifier, despite a lower Precision than the former. 
+An important remark is that we are mainly interested in achieving an high recall, since we want to detect as many Diabetic people as possible to allow them to preventive care; our model overtakes both Frequentistic LR and SVM.
+
+#### Confusion Matrix
+
+```{r, warning= FALSE, echo = FALSE}
+
+cfm <- as.tibble(table(tibble("target" = test.data$Y,
+                     "prediction" = Y_pred.jags)))
+
+cfm$target <- ifelse(cfm$target==1, 'Positive','Negative')
+cfm$prediction <- ifelse(cfm$prediction==1, 'Positive','Negative')
+
+plot_confusion_matrix(cfm, 
+                      target_col = "target", 
+                      prediction_col = "prediction",
+                      counts_col = "n")
+
+
+```
+
+
+#### ROC CURVE
+ROC curve for different values of cutoffs $p$ for classifying observations: 
+
+```{r echo = F, message = F, warning=F}
+
+scores <- jags.prediction(test.data[which(names(test.data)!='x3')])$scores
+
+rocobj <- pROC::roc(test.data$Y, scores.jags)
+area.under.ROC <- round(auc(rocobj),3)
+
+p <- ifelse(abs(rocobj$thresholds)<1,rocobj$thresholds,0.001 )
+
+lab.ix <- seq(2,(length(rocobj$thresholds)-1),by = (length(rocobj$thresholds)-1)/10)
+
+lab.x <- 1- rocobj$specificities[lab.ix]
+lab.y <- rocobj$sensitivities[lab.ix]
+lab.p <- round(rocobj$thresholds[lab.ix],1)
+
+ggplot() +
+  geom_path( aes(x=1-rocobj$specificities,
+                 y=rocobj$sensitivities,
+                 color = p),
+             lwd = 1)+
+
+   geom_text(aes(x = lab.x, 
+                 y= lab.y, 
+                 label = lab.p,
+                 ),
+             color = 'orange',
+             nudge_y = 0.05)+
+  theme_minimal()+
+  geom_segment(aes(x = 0 , 
+                   y = 0, 
+                   xend = 1, 
+                   yend = 1),
+               color = 'orange',
+               linetype = 'dashed')+
+  annotate(geom = "text", 
+           x = 0.5, 
+           y = 0.55, 
+           label = "Random Classifier", 
+           color = "orange",
+           angle = 35)+
+    annotate(geom = "text", 
+           x = 0.8, 
+           y = 0.25, 
+           label = paste('AUROC:',area.under.ROC))+
+  ylab('Sensitivity (TPR)')+
+  xlab('1-Specificity (FPR)')+
+  ggtitle('ROC Curve')
+
+```
+
+
+The area under the ROC curve is:   `r area.under.ROC `
+
+
+# Bibliography
+
+Mohammed, Ahmed & Hassan, Masoud & Kadir, Dler. (2020). Improving Classification Performance for a Novel Imbalanced Medical Dataset using SMOTE Method. International Journal of Advanced Trends in Computer Science and Engineering. 9. 3161-3172. 10.30534/ijatcse/2020/104932020. 
+
+
+Hassan, Masoud. (2020). A Fully Bayesian Logistic Regression Model for Classification of ZADA Diabetes Dataset. Science Journal of University of Zakho. 8. 105-111. 10.25271/sjuoz.2020.8.3.707. 
